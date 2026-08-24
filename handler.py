@@ -200,9 +200,7 @@ def handler(job):
         "model_repo": REGISTRY[style],
     }
 
-# --- RunPod bootstrap ---
-if __name__ == "__main__":
-    import runpod
-    # Warm illustrious in background after start (non-blocking)
-    print("[boot] handler ready — starting runpod.serverless", flush=True)
-    runpod.serverless.start({"handler": handler})
+# --- RunPod bootstrap (must be at top-level so RunPod's scanner finds it) ---
+import runpod
+print("[boot] handler ready — starting runpod.serverless", flush=True)
+runpod.serverless.start({"handler": handler})
