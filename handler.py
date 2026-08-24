@@ -1,24 +1,15 @@
-"""
-RunPod Serverless — Roleplay NSFW (anime+general, natural language, image refs)
-Cheapest 1080p: Illustrious XL v2.0 (casual language + Danbooru, per HF card) + Pony/NoobAI/Realistic switch.
-No safety checker — uncensored.
-
-RunPod protocol:
-  POST {"input": {"prompt": "...", "style":"illustrious", ...}}
-  -> {"images": [{"b64": "data:image/jpeg;base64,..."}], "seed":..., "timings":...}
+﻿"""
+RunPod Serverless — darkcoal-imagen
 """
 import os, io, base64, time, requests, traceback
-from typing import List, Optional
 from PIL import Image
 
 _PIPE_CACHE: dict = {}
-_LORA_CACHE: dict = {}
-
 REGISTRY = {
     "illustrious": "OnomaAIResearch/Illustrious-XL-v2.0",
-    "pony":        "AstraliteHeart/pony-diffusion-v6-xl",
-    "noobai":      "Laxhar/NoobAI-XL-Vpred-1.0",
-    "realistic":   "stabilityai/stable-diffusion-xl-base-1.0",
+    "pony": "AstraliteHeart/pony-diffusion-v6-xl",
+    "noobai": "Laxhar/NoobAI-XL-Vpred-1.0",
+    "realistic": "stabilityai/stable-diffusion-xl-base-1.0",
 }
 
 def _load_pipe(style: str):
@@ -31,7 +22,6 @@ def _load_pipe(style: str):
     kwargs = dict(torch_dtype=torch.float16, use_safetensors=True)
     if hf_token:
         kwargs["token"] = hf_token
-    # Try with fp16 variant, fallback without (some repos have no fp16 folder)
     tried = []
     pipe = None
     for variant in ("fp16", None):
@@ -41,9 +31,7 @@ def _load_pipe(style: str):
                 kw["variant"] = variant
             if style == "noobai":
                 p = StableDiffusionXLPipeline.from_pretrained(repo, **kw)
-                p.scheduler = EulerDiscreteScheduler.from_config(
-                    p.scheduler.config, prediction_type="v_prediction", rescale_betas_zero_snr=True
-                )
+                p.scheduler = EulerDiscreteScheduler.from_config(p.scheduler.config, prediction_type="v_prediction", rescale_betas_zero_snr=True)
             else:
                 p = StableDiffusionXLPipeline.from_pretrained(repo, **kw)
                 p.scheduler = EulerAncestralDiscreteScheduler.from_config(p.scheduler.config)
@@ -64,8 +52,6 @@ def _load_pipe(style: str):
     return pipe
 
 def _fetch_image(url: str) -> Image.Image:
-    if not url:
-        raise ValueError("empty image url")
     if url.startswith("data:"):
         _, b64 = url.split(",", 1)
         return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
@@ -76,131 +62,82 @@ def _fetch_image(url: str) -> Image.Image:
 def _pil_to_b64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=92, optimize=True)
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    return f"data:image/jpeg;base64,{b64}"
+    return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
 
 def handler(job):
-    """
-    job = {"id": "...", "input": {style, prompt, negative_prompt, width, height, steps, guidance, seed, image_urls, denoising_strength, lora_urls, lora_scales, num_images}}
-    """
     t0 = time.time()
     inp = job.get("input", {}) if isinstance(job, dict) else {}
     style = inp.get("style") or "illustrious"
     if style not in REGISTRY:
         style = "illustrious"
-    prompt: str = inp.get("prompt") or ""
+    prompt = inp.get("prompt") or ""
     if not prompt:
         return {"error": "prompt is required"}
-    negative_prompt: str = inp.get("negative_prompt") or ""
-    width: int  = int(inp.get("width")  or inp.get("w") or 1088)
-    height: int = int(inp.get("height") or inp.get("h") or 1920)
-    steps: int  = int(inp.get("steps") or 20)
-    guidance: float = float(inp.get("guidance") or 6.0)
+    negative_prompt = inp.get("negative_prompt") or ""
+    width = int(inp.get("width") or inp.get("w") or 1088)
+    height = int(inp.get("height") or inp.get("h") or 1920)
+    steps = int(inp.get("steps") or 20)
+    guidance = float(inp.get("guidance") or 6.0)
     seed = inp.get("seed")
-    num_images: int = int(inp.get("num_images") or inp.get("n") or 1)
+    num_images = max(1, min(4, int(inp.get("num_images") or inp.get("n") or 1)))
     image_urls = inp.get("image_urls") or (inp.get("image_url") and [inp.get("image_url")]) or None
+    denoising_strength = float(inp.get("denoising_strength") or 0.62)
+    width = (width // 8) * 8; height = (height // 8) * 8
     lora_urls = inp.get("lora_urls")
     lora_scales = inp.get("lora_scales")
-    denoising_strength: float = float(inp.get("denoising_strength") or 0.62)
-
-    width = (width // 8) * 8; height = (height // 8) * 8
-    num_images = max(1, min(4, num_images))
-
     import torch
     pipe = _load_pipe(style)
-
-    # optional ephemeral LoRAs
     loaded = []
+    _LORA_CACHE = {}
     if lora_urls:
         if isinstance(lora_urls, str): lora_urls = [lora_urls]
         scales = lora_scales or [0.9]*len(lora_urls)
         for url, sc in zip(lora_urls, scales):
-            if url not in _LORA_CACHE:
-                print(f"[lora] fetch {url}", flush=True)
-                try:
-                    pipe.load_lora_weights(url, adapter_name=url[:40])
-                    _LORA_CACHE[url] = url[:40]
-                except Exception as e:
-                    print(f"[lora] direct failed {e}, downloading...", flush=True)
-                    r = requests.get(url, timeout=80); r.raise_for_status()
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tf:
-                        tf.write(r.content); tmp=tf.name
-                    pipe.load_lora_weights(os.path.dirname(tmp), weight_name=os.path.basename(tmp), adapter_name=url[:40])
-                    try: os.remove(tmp)
-                    except: pass
-                    _LORA_CACHE[url] = url[:40]
+            print(f"[lora] {url}", flush=True)
             try:
-                pipe.set_adapters([_LORA_CACHE[url]], adapter_weights=[float(sc)])
-            except Exception:
-                pass
+                pipe.load_lora_weights(url, adapter_name=url[:40])
+                _LORA_CACHE[url] = url[:40]
+            except Exception as e:
+                r = requests.get(url, timeout=80); r.raise_for_status()
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tf:
+                    tf.write(r.content); tmp=tf.name
+                pipe.load_lora_weights(os.path.dirname(tmp), weight_name=os.path.basename(tmp), adapter_name=url[:40])
+                try: os.remove(tmp)
+                except: pass
+                _LORA_CACHE[url] = url[:40]
+            try: pipe.set_adapters([_LORA_CACHE[url]], adapter_weights=[float(sc)])
+            except: pass
             loaded.append(url)
-
     seed_val = int(seed) if seed is not None else int(torch.randint(0, 2**31-1, (1,)).item())
     gen = torch.Generator("cuda").manual_seed(seed_val)
-
     is_img2img = bool(image_urls)
     ref = None
     if is_img2img:
         if isinstance(image_urls, str): image_urls = [image_urls]
-        try:
-            ref = _fetch_image(image_urls[0]).resize((width, height), Image.LANCZOS)
-        except Exception as e:
-            traceback.print_exc()
-            return {"error": f"failed to fetch image_urls[0]: {e}"}
-
+        ref = _fetch_image(image_urls[0]).resize((width, height), Image.LANCZOS)
     try:
         if is_img2img:
-            # Use Img2Img pipeline derived from the loaded txt2img pipe (shares weights/VRAM)
             from diffusers import StableDiffusionXLImg2ImgPipeline
-            # Create img2img pipe on the fly from current pipe to avoid double VRAM
-            try:
-                img_pipe = StableDiffusionXLImg2ImgPipeline.from_pipe(pipe)
-            except Exception:
-                img_pipe = pipe  # fallback: some diffusers versions allow image kwarg on txt2img
-            images = img_pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt or None,
-                image=ref,
-                strength=float(denoising_strength),
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                generator=gen,
-                num_images_per_prompt=num_images,
-            ).images
+            try: img_pipe = StableDiffusionXLImg2ImgPipeline.from_pipe(pipe)
+            except: img_pipe = pipe
+            images = img_pipe(prompt=prompt, negative_prompt=negative_prompt or None, image=ref, strength=float(denoising_strength), num_inference_steps=steps, guidance_scale=guidance, generator=gen, num_images_per_prompt=num_images).images
         else:
-            images = pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt or None,
-                width=width, height=height,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                generator=gen,
-                num_images_per_prompt=num_images,
-            ).images
+            images = pipe(prompt=prompt, negative_prompt=negative_prompt or None, width=width, height=height, num_inference_steps=steps, guidance_scale=guidance, generator=gen, num_images_per_prompt=num_images).images
     except Exception as e:
         traceback.print_exc()
         return {"error": f"inference failed: {e}"}
     finally:
         if loaded:
             try: pipe.unload_lora_weights()
-            except Exception: pass
-
+            except: pass
     out = []
     for im in images:
-        b64 = _pil_to_b64(im)
-        out.append({"b64": b64, "width": width, "height": height, "content_type": "image/jpeg"})
-
+        out.append({"b64": _pil_to_b64(im), "width": width, "height": height, "content_type": "image/jpeg"})
     dt = time.time() - t0
-    return {
-        "images": out,
-        "seed": seed_val,
-        "timings": {"inference": round(dt, 3), "steps": steps, "width": width, "height": height},
-        "style": style,
-        "model_repo": REGISTRY[style],
-    }
+    return {"images": out, "seed": seed_val, "timings": {"inference": round(dt,3), "steps": steps, "width": width, "height": height}, "style": style, "model_repo": REGISTRY[style]}
 
 # --- RunPod bootstrap (must be at top-level so RunPod's scanner finds it) ---
 import runpod
-print("[boot] handler ready — starting runpod.serverless", flush=True)
+print("[boot] handler ready - starting runpod.serverless", flush=True)
 runpod.serverless.start({"handler": handler})
