@@ -1,0 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+runpod==1.7.10
+torch==2.5.1
+diffusers==0.33.1
+transformers==4.49.0
+accelerate==1.6.0
+pillow==11.1.0
+requests
+safetensors
+huggingface_hub
+numpy==1.26.4
